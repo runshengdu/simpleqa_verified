@@ -1,9 +1,9 @@
 models:
-  - name: deepseek-chat
+  - name: deepseek-reasoner
     temperature: 1.0
     base_url: https://api.deepseek.com
     api_key: "${DEEPSEEK_API_KEY}"
-    max_tokens: 8000
+    max_tokens: 60000
 
   - name: google/gemini-3-flash-preview
     temperature: 0.0

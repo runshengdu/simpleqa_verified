@@ -1,20 +1,22 @@
-# LLM Evaluation Framework
+# SimpleQA Verified Evaluation Framework
 
-This project provides an automated framework for evaluating Large Language Models (LLMs) on factual questions using a "Model-as-a-Judge" approach. It compares model predictions against gold-standard answers and uses a judge model to grade the correctness.
+This project provides an automated framework for evaluating Large Language Models (LLMs) on the **SimpleQA Verified** benchmark, as described in the paper [SimpleQA Verified: A Reliable Factuality Benchmark to Measure Parametric Knowledge](https://arxiv.org/abs/2509.07968).
+
+It uses a "Model-as-a-Judge" approach to grade model predictions against gold-standard answers.
 
 ## Features
 
-- **Automated Evaluation**: Automatically queries models and grades their answers.
+- **Automated Evaluation**: Automatically queries models and grades their answers using a judge model.
 - **Async & Concurrent**: Uses `asyncio` for high-throughput concurrent API calls.
 - **Streaming Support**: Handles streaming API responses for better compatibility and reliability.
 - **Resume Capability**: Automatically detects existing results and resumes evaluation where it left off.
 - **Flexible Configuration**: Define models and evaluators easily in YAML files.
-- **Standardized Output**: Produces detailed JSON reports with queries, predictions, gold answers, and scores.
+- **Detailed Reporting**: Produces JSON reports with full configuration, metrics (F1, Accuracy), and per-task results.
 
 ## Prerequisites
 
 - Python 3.8+
-- Required Python packages (install via pip):
+- Required Python packages:
   ```bash
   pip install openai pyyaml tqdm
   ```
@@ -48,7 +50,7 @@ models:
 
 ## Usage
 
-Run the main script to start the evaluation:
+Run the main script to start the evaluation. You can specify the model to evaluate and the evaluator (judge) model using command-line arguments.
 
 ```bash
 python main.py [options]
@@ -56,66 +58,101 @@ python main.py [options]
 
 ### Arguments
 
-- `--save-to`: (Optional) Custom path to save the results JSON file.
+- `--model-id`: The name of the model to evaluate (must match a name in `models.yaml`). Default: `kimi-k2.5`.
+- `--evaluator`: The name of the judge model (must match a name in `evaluators.yaml`). Default: `deepseek-reasoner`.
+- `--save-to`: (Optional) Custom path to save the results JSON file. If not provided, results are saved to `result/<model_slug>/simpleqa_verified/<timestamp>.json`.
 - `--num-tasks`: (Optional) Number of tasks to run from the start of the dataset. Useful for testing.
+- `--max-workers`: (Optional) Maximum number of concurrent tasks. Default: 50.
 
 ### Examples
 
-Run evaluation on all tasks:
+Run evaluation with default settings:
 ```bash
 python main.py
 ```
 
-Run only the first 10 tasks:
+Evaluate `gpt-4o` using `deepseek-chat` as the judge:
+```bash
+python main.py --model-id openai/gpt-4o --evaluator deepseek-chat
+```
+
+Run only the first 10 tasks for testing:
 ```bash
 python main.py --num-tasks 10
 ```
 
-Save results to a specific file:
-```bash
-python main.py --save-to results/my_eval.json
-```
-
 ## How It Works
 
-1. **Dataset Loading**: Reads questions and gold answers from `dataset/FACTS-Parametric-public.csv`.
-2. **Prediction**: Queries the target model (defined in `main.py` as `MODEL_TO_EVALUATE`) for an answer.
+1. **Dataset Loading**: Reads questions and gold answers from `dataset/simpleqa_verified.csv`.
+2. **Prediction**: Queries the target model (specified by `--model-id`) for an answer.
 3. **Grading**:
-   - The judge model (defined as `JUDGE_MODEL`) compares the predicted answer with the gold answer.
-   - Grading is performed 3 times for robustness.
-   - Grades: `CORRECT`, `MISTAKE`, `UNKNOWN`, `NOT_ATTEMPTED`.
+   - The judge model (specified by `--evaluator`) compares the predicted answer with the gold answer.
+   - It assigns a grade: `A` (CORRECT), `B` (INCORRECT), or `C` (NOT_ATTEMPTED).
 4. **Scoring**:
-   - A score of `1.0` is assigned if **all 3** judgments are `CORRECT`.
-   - Otherwise, the score is `0.0`.
-5. **Output**: Results are saved incrementally to a JSON file.
+   - `CORRECT` (A) = 1.0
+   - `INCORRECT` (B) / `NOT_ATTEMPTED` (C) = 0.0
+5. **Metrics**:
+   - **F1 Score**: Harmonic mean of precision (accuracy given attempted) and recall (mean correct).
+   - **Mean Correct**: Percentage of correct answers (Recall).
+   - **Accuracy Given Attempted**: Accuracy on questions the model attempted to answer.
+   - **Attempt Rate**: Percentage of questions the model attempted.
+6. **Output**: Results are saved incrementally to a JSON file.
 
 ## Output Format
 
-The output JSON file contains the mean score and a list of detailed results for each task:
+The output JSON file contains the configuration, summary metrics, and detailed results:
 
 ```json
 {
-  "calculate_mean_score": 0.5,
+  "model_config": {
+    "name": "model-name",
+    "base_url": "...",
+    "temperature": 0.5
+    // api_key is excluded
+  },
+  "evaluator_config": {
+    "name": "judge-name",
+    "base_url": "...",
+    // api_key is excluded
+  },
+  "summary": {
+    "f1": 0.45,
+    "mean_correct": 0.4,
+    "accuracy_given_attempted": 0.6,
+    "attempt_rate": 0.66,
+    "counts": {
+      "total": 100,
+      "correct": 40,
+      "incorrect": 20,
+      "not_attempted": 40
+    }
+  },
   "results": [
     {
-      "id": "task_id",
+      "id": "0",
       "query": "Question text...",
       "llm_answer": "Model's predicted answer...",
       "gold_answer": "Correct answer...",
-      "final_score": 1.0
+      "grade_letter": "A",
+      "grade_str": "CORRECT",
+      "final_score": 1.0,
+      ...
     },
     ...
   ]
 }
 ```
 
-## Customization
+## Reference
 
-To change the model being evaluated or the judge model, modify the constants in `main.py`:
+If you use this benchmark or code, please cite the original paper:
 
-```python
-MODEL_TO_EVALUATE = "minimax-m2.1"
-JUDGE_MODEL = "deepseek-chat"
+```bibtex
+@article{simpleqa_verified_2025,
+  title={SimpleQA Verified: A Reliable Factuality Benchmark to Measure Parametric Knowledge},
+  author={Lukas Haas and others},
+  journal={arXiv preprint arXiv:2509.07968},
+  year={2025},
+  url={https://arxiv.org/abs/2509.07968}
+}
 ```
-
-Ensure these names correspond to entries in `models.yaml` and `evaluators.yaml`.
