@@ -34,7 +34,7 @@ models:
     max_tokens: 128000
     extra_body: {"reasoning_split": True} 
 
-  - name: minimax-m2.1
+  - name: minimax-m2.5
     temperature: 1.0
     base_url: https://api.minimaxi.com/v1
     api_key: "${MINIMAX_API_KEY}"
