@@ -1,15 +1,23 @@
 import argparse
 import asyncio
-import csv
 import json
 import re
 from collections import Counter
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
-from common_config import load_yaml_config, get_client_params
+from common_config import (
+    build_default_result_path,
+    build_simpleqa_output_payload,
+    get_client_params,
+    load_json,
+    load_simpleqa_dataset,
+    load_simpleqa_output,
+    load_yaml_config,
+    save_json,
+    strip_sensitive_config,
+)
 from prompts import QUERY_TEMPLATE, GRADER_TEMPLATE
 
 # Configuration Constants
@@ -119,11 +127,9 @@ async def generate_task(
     """Generates answer for a single task."""
     async with sem:
         try:
-            query = item.get("problem", "")
-            gold_answer = item.get("answer", "")
-            item_id = item.get("original_index")
-            if item_id is None or str(item_id).strip() == "":
-                item_id = item.get("id")
+            query = item.get("query", "")
+            gold_answer = item.get("gold_answer", "")
+            item_id = item.get("id")
 
             formatted_prompt = QUERY_TEMPLATE.format(question=query)
             try:
@@ -134,11 +140,15 @@ async def generate_task(
                     **generator_kwargs,
                 )
                 if not prediction:
+                    print(
+                        "Generation returned empty content; skip writing "
+                        f"(id={item_id})"
+                    )
                     return None
             except Exception:
                 print(
-                    "Generation failed after retries "
-                    f"(original_index={item.get('original_index')}, problem={query})"
+                    "Generation API failed after retries; skip writing "
+                    f"(id={item_id}, problem={query})"
                 )
                 return None
 
@@ -168,8 +178,8 @@ async def evaluate_generated_task(
     """Evaluates a generated answer."""
     async with sem:
         try:
-            query = item.get("query") or item.get("problem", "")
-            gold_answer = item.get("gold_answer") or item.get("answer", "")
+            query = item.get("query", "")
+            gold_answer = item.get("gold_answer", "")
             prediction = item.get("llm_answer", "")
             item_id = item.get("id")
 
@@ -189,6 +199,17 @@ async def evaluate_generated_task(
                     **judge_kwargs,
                 )
             except Exception:
+                print(
+                    "Evaluation API failed after retries; skip writing "
+                    f"(id={item_id}, query={query})"
+                )
+                return None
+
+            if not isinstance(grading_response_text, str) or not grading_response_text.strip():
+                print(
+                    "Evaluation returned empty content; skip writing "
+                    f"(id={item_id}, query={query})"
+                )
                 return None
 
             grade_letter = extract_grade_letter(grading_response_text)
@@ -210,57 +231,31 @@ async def evaluate_generated_task(
             print(f"Task {item.get('id')} evaluation failed: {e}")
             return None
 
-def build_output_path(save_to: Optional[str], model_id: str) -> Path:
-    if save_to:
-        return Path(save_to)
+def normalize_results_for_evaluation(results: List[Dict[str, Any]]) -> None:
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        if not item.get("query"):
+            item["query"] = item.get("problem", "")
+        if not item.get("gold_answer"):
+            item["gold_answer"] = item.get("answer", "")
+        if item.get("id") is None:
+            fallback_id = item.get("original_index")
+            if fallback_id is not None:
+                item["id"] = str(fallback_id)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_slug = model_id.replace("/", "_")
-    test_set_slug = Path(DATASET_PATH).stem
-    return Path(f"result/{model_slug}/{test_set_slug}/{timestamp}.json")
 
-def load_dataset(path: str) -> Optional[List[Dict[str, Any]]]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            dataset = list(csv.DictReader(f))
-    except FileNotFoundError:
-        print(f"Dataset not found at {path}")
-        return None
-
-    for idx, item in enumerate(dataset):
-        item_id = item.get("original_index") or item.get("id") or str(idx)
-        item["id"] = str(item_id).strip()
-    return dataset
-
-def save_generation_output(
-    output_path: Path,
-    model_config: Dict[str, Any],
-    all_results: List[Dict[str, Any]],
-) -> None:
-    output_data = {
-        "model_config": model_config,
-        "results": all_results,
-    }
-    output_path.write_text(
-        json.dumps(output_data, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-def build_ordered_output_payload(
-    model_config: Optional[Dict[str, Any]],
-    results: List[Dict[str, Any]],
-    evaluator_config: Optional[Dict[str, Any]] = None,
-    summary: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {
-        "model_config": model_config or {},
-    }
-    if evaluator_config is not None:
-        payload["evaluator_config"] = evaluator_config
-    if summary is not None:
-        payload["summary"] = summary
-    payload["results"] = results
-    return payload
+def print_mode_completion(mode: str, wrote_any_result: bool, pending_count: int, path: Path) -> None:
+    if wrote_any_result:
+        print(f"{mode} complete. Saved to {path}")
+        return
+    if pending_count:
+        print(
+            f"{mode} complete but no new valid results were produced "
+            "(API errors or empty responses); skipped writing JSON."
+        )
+        return
+    print(f"{mode} complete. No pending items; skipped writing JSON.")
 
 def is_already_evaluated(item: Dict[str, Any]) -> bool:
     judge = item.get("judge")
@@ -274,7 +269,7 @@ def load_results_payload(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        content = json.loads(path.read_text(encoding="utf-8"))
+        content = load_json(path)
     except json.JSONDecodeError:
         print(f"Evaluate file is not valid JSON: {path}")
         return None
@@ -288,24 +283,16 @@ def load_results_payload(path: Path) -> Optional[Dict[str, Any]]:
     return content
 
 def load_existing_generation_results(output_path: Path) -> List[Dict[str, Any]]:
-    if not output_path.exists():
-        return []
-
-    try:
-        content = json.loads(output_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        print("Output file exists but is not valid JSON. Starting fresh.")
-        return []
-
-    if isinstance(content, dict):
-        results = content.get("results", [])
-        return results if isinstance(results, list) else []
-    if isinstance(content, list):
-        return content
-    return []
+    content = load_simpleqa_output(output_path)
+    results = content.get("results", [])
+    return results if isinstance(results, list) else []
 
 async def run_generation_mode(args: argparse.Namespace) -> None:
-    output_path = build_output_path(args.save_to, args.model_id)
+    output_path = build_default_result_path(
+        model_id=args.model_id,
+        dataset_path=DATASET_PATH,
+        save_to=args.save_to,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     model_cfg = load_yaml_config(MODELS_CONFIG_PATH, args.model_id)
@@ -316,12 +303,14 @@ async def run_generation_mode(args: argparse.Namespace) -> None:
     model_params, model_kwargs = get_client_params(model_cfg)
     generator_client = AsyncOpenAI(**model_params)
 
-    dataset = load_dataset(DATASET_PATH)
-    if dataset is None:
+    try:
+        dataset = load_simpleqa_dataset(DATASET_PATH, args.num_tasks)
+    except FileNotFoundError:
+        print(f"Dataset not found at {DATASET_PATH}")
         return
-
-    if args.num_tasks:
-        dataset = dataset[:args.num_tasks]
+    except Exception as e:
+        print(f"Failed to load dataset from {DATASET_PATH}: {e}")
+        return
 
     existing_results = load_existing_generation_results(output_path)
     generated_ids = {
@@ -345,18 +334,24 @@ async def run_generation_mode(args: argparse.Namespace) -> None:
     ]
 
     all_results = list(existing_results)
-    output_model_config = {k: v for k, v in model_cfg.items() if k != "api_key"}
+    output_model_config = strip_sensitive_config(model_cfg)
+    wrote_any_result = False
 
     if tasks:
         for future in tqdm.as_completed(tasks, total=len(tasks), desc="Generating"):
             if result := await future:
                 all_results.append(result)
                 try:
-                    save_generation_output(output_path, output_model_config, all_results)
+                    output_data = build_simpleqa_output_payload(
+                        model_config=output_model_config,
+                        results=all_results,
+                    )
+                    save_json(output_path, output_data)
+                    wrote_any_result = True
                 except Exception as e:
                     print(f"Error saving: {e}")
 
-    print(f"Generation complete. Saved to {output_path}")
+    print_mode_completion("Generation", wrote_any_result, len(tasks_to_run), output_path)
 
 async def run_evaluation_mode(args: argparse.Namespace) -> None:
     evaluate_path = Path(args.evaluate_file)
@@ -373,6 +368,7 @@ async def run_evaluation_mode(args: argparse.Namespace) -> None:
     judge_client = AsyncOpenAI(**judge_params)
 
     results = payload.get("results", [])
+    normalize_results_for_evaluation(results)
     pending_indices = [
         idx for idx, item in enumerate(results) if isinstance(item, dict) and not is_already_evaluated(item)
     ]
@@ -384,34 +380,26 @@ async def run_evaluation_mode(args: argparse.Namespace) -> None:
 
     sem = asyncio.Semaphore(args.eval_workers)
     tasks = [asyncio.create_task(evaluate_at_index(idx)) for idx in pending_indices]
+    wrote_any_result = False
 
     if tasks:
         for future in tqdm.as_completed(tasks, total=len(tasks), desc="Evaluating"):
             idx, result = await future
             if result:
                 results[idx] = result
-                payload = build_ordered_output_payload(
+                payload = build_simpleqa_output_payload(
                     model_config=payload.get("model_config") if isinstance(payload.get("model_config"), dict) else {},
                     results=results,
-                    evaluator_config={k: v for k, v in judge_cfg.items() if k != "api_key"},
+                    evaluator_config=strip_sensitive_config(judge_cfg),
                     summary=calculate_summary(results),
                 )
                 try:
-                    evaluate_path.write_text(
-                        json.dumps(payload, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
+                    save_json(evaluate_path, payload)
+                    wrote_any_result = True
                 except Exception as e:
                     print(f"Error saving: {e}")
 
-    payload = build_ordered_output_payload(
-        model_config=payload.get("model_config") if isinstance(payload.get("model_config"), dict) else {},
-        results=results,
-        evaluator_config={k: v for k, v in judge_cfg.items() if k != "api_key"},
-        summary=calculate_summary(results),
-    )
-    evaluate_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"Evaluation complete. Saved to {evaluate_path}")
+    print_mode_completion("Evaluation", wrote_any_result, len(pending_indices), evaluate_path)
 
 async def main_async():
     parser = argparse.ArgumentParser()

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import re
 import sys
@@ -21,10 +20,23 @@ if _src.is_dir() and str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
 from common_config import (
+    build_default_result_path,
+    build_simpleqa_output_payload,
+    custom_id_for_key,
     ensure_parent_dir,
+    extract_text_from_file_content,
+    load_json,
+    load_simpleqa_dataset,
+    load_simpleqa_output,
     load_yaml_config,
     make_chat_completion_create_kwargs,
+    parse_batch_output,
     sanitize_path_component,
+    read_existing_generated_ids_simpleqa,
+    save_json,
+    save_text,
+    strip_sensitive_config,
+    upsert_simpleqa_results,
 )
 from prompts import QUERY_TEMPLATE  # noqa: E402
 
@@ -122,19 +134,14 @@ def _input_csv_path(args: argparse.Namespace) -> str:
     return p
 
 
-def _default_simpleqa_output_path(model_id: str, input_csv: str) -> str:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_slug = str(model_id).replace("/", "_")
-    test_set_slug = Path(input_csv).stem
-    return str((REPO_ROOT / f"result/{model_slug}/{test_set_slug}/{timestamp}.json").resolve())
-
-
 def _resolve_responses_path(args: argparse.Namespace) -> str:
-    if args.save_to:
-        p = str(Path(args.save_to).resolve())
-        ensure_parent_dir(p)
-        return p
-    p = _default_simpleqa_output_path(str(args.model_id), _input_csv_path(args))
+    p = str(
+        build_default_result_path(
+            model_id=str(args.model_id),
+            dataset_path=_input_csv_path(args),
+            save_to=args.save_to,
+        ).resolve()
+    )
     ensure_parent_dir(p)
     return p
 
@@ -179,70 +186,12 @@ def make_client(model_id: str, models_yaml: str) -> OpenAI:
     return OpenAI(api_key=cfg["api_key"], base_url=cfg["base_url"])
 
 
-def save_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def load_json(path: Path) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-
-
-def extract_text_from_file_content(content_obj: Any) -> str:
-    text_attr = getattr(content_obj, "text", None)
-    if isinstance(text_attr, str):
-        return text_attr
-    if callable(text_attr):
-        return text_attr()
-    read_method = getattr(content_obj, "read", None)
-    if callable(read_method):
-        raw = read_method()
-        if isinstance(raw, bytes):
-            return raw.decode("utf-8")
-        return str(raw)
-    return str(content_obj)
-
-
 def build_run_dir(artifacts_dir: Path, model_id: str) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_model = sanitize_path_component(str(model_id))
     run_dir = Path(artifacts_dir) / safe_model / timestamp
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
-
-
-def _coerce_token_int(value: Any, default: int = 0) -> int:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(value)
-    if isinstance(value, str) and value.lstrip("+-").isdigit():
-        return int(value)
-    return default
-
-
-def _custom_id_for_key(key: int) -> str:
-    return f"key-{key}"
-
-
-def parse_key_from_custom_id(custom_id: str) -> int | None:
-    if not isinstance(custom_id, str) or not custom_id.startswith("key-"):
-        return None
-    rest = custom_id[len("key-") :]
-    if not rest:
-        return None
-    try:
-        return int(rest, 10)
-    except ValueError:
-        return None
 
 
 def build_batch_input_file(
@@ -259,7 +208,7 @@ def build_batch_input_file(
             sk = str(int(key))
             create_kwargs = make_chat_completion_create_kwargs(model_cfg, messages)
             body = build_batch_request_body(model_id, create_kwargs)
-            custom_id = _custom_id_for_key(int(key))
+            custom_id = custom_id_for_key(int(key))
             request_obj: dict[str, Any] = {
                 "custom_id": custom_id,
                 "method": "POST",
@@ -286,7 +235,7 @@ def build_batch_input_file_simpleqa(
             sk = str(int(key))
             create_kwargs = make_chat_completion_create_kwargs(model_cfg, messages)
             body = build_batch_request_body(model_id, create_kwargs)
-            custom_id = _custom_id_for_key(int(key))
+            custom_id = custom_id_for_key(int(key))
             request_obj: dict[str, Any] = {
                 "custom_id": custom_id,
                 "method": "POST",
@@ -306,122 +255,6 @@ def build_batch_input_file_simpleqa(
                 "urls": payload.get("urls"),
             }
     return key_payloads
-
-
-def load_simpleqa_dataset(path: str, num_tasks: int | None) -> list[dict[str, Any]]:
-    with open(path, "r", encoding="utf-8", newline="") as f:
-        rows = list(csv.DictReader(f))
-    if num_tasks:
-        rows = rows[:num_tasks]
-    normalized: list[dict[str, Any]] = []
-    for idx, row in enumerate(rows):
-        item_id = row.get("original_index") or row.get("id") or str(idx)
-        normalized.append(
-            {
-                "id": str(item_id).strip(),
-                "query": row.get("problem", ""),
-                "gold_answer": row.get("answer", ""),
-                "topic": row.get("topic"),
-                "answer_type": row.get("answer_type"),
-                "multi_step": row.get("multi_step"),
-                "requires_reasoning": row.get("requires_reasoning"),
-                "urls": row.get("urls"),
-            }
-        )
-    return normalized
-
-
-def load_simpleqa_output(path: str) -> dict[str, Any]:
-    p = Path(path)
-    if not p.is_file():
-        return {"results": []}
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {"results": []}
-    if isinstance(data, dict) and isinstance(data.get("results"), list):
-        return data
-    return {"results": []}
-
-
-def read_existing_generated_ids_simpleqa(path: str) -> set[str]:
-    payload = load_simpleqa_output(path)
-    ids: set[str] = set()
-    for item in payload.get("results", []):
-        if isinstance(item, dict) and item.get("id") is not None and item.get("llm_answer"):
-            ids.add(str(item.get("id")))
-    return ids
-
-
-def upsert_simpleqa_results(existing: list[dict[str, Any]], updates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    index_by_id: dict[str, int] = {}
-    for idx, item in enumerate(existing):
-        if isinstance(item, dict) and item.get("id") is not None:
-            index_by_id[str(item.get("id"))] = idx
-    for item in updates:
-        sid = str(item.get("id"))
-        if sid in index_by_id:
-            existing[index_by_id[sid]] = item
-        else:
-            index_by_id[sid] = len(existing)
-            existing.append(item)
-    return existing
-
-
-def parse_batch_output(
-    output_text: str,
-    key_payloads: dict[str, dict[str, Any]],
-) -> tuple[dict[str, dict[str, Any]], set[str]]:
-    """Map str(key) -> {response, total_tokens}; second return is failed str keys (HTTP/parsing)."""
-    key_results: dict[str, dict[str, Any]] = {}
-    failed: set[str] = set()
-
-    for raw_line in output_text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            data = json.loads(line)
-        except Exception:
-            continue
-
-        k_int = parse_key_from_custom_id(data.get("custom_id", ""))
-        if k_int is None:
-            continue
-        sk = str(k_int)
-        if sk not in key_payloads:
-            continue
-
-        err = data.get("error")
-        response = data.get("response") or {}
-        status_code = response.get("status_code")
-        body = response.get("body") or {}
-
-        if err is not None or status_code not in {0, 200}:
-            failed.add(sk)
-            continue
-
-        choices = body.get("choices") or []
-        if not choices:
-            failed.add(sk)
-            continue
-
-        message = choices[0].get("message") or {}
-        content = message.get("content")
-        usage = body.get("usage") or {}
-        prompt_tokens = _coerce_token_int(usage.get("prompt_tokens"), 0)
-        completion_tokens = _coerce_token_int(usage.get("completion_tokens"), 0)
-        total_tokens = _coerce_token_int(usage.get("total_tokens"), 0) or (prompt_tokens + completion_tokens)
-
-        if not isinstance(content, str):
-            failed.add(sk)
-            continue
-
-        key_results[sk] = {
-            "response": content,
-            "total_tokens": int(total_tokens),
-        }
-    return key_results, failed
 
 
 def upload_input_file(client: OpenAI, input_path: Path) -> str:
@@ -555,7 +388,7 @@ def stage_prepare(args: argparse.Namespace) -> Path:
         "poll_interval_seconds": int(args.poll_interval_seconds),
         "submitted_keys": sorted(set(all_submitted)),
         "resume_skipped": resume_skipped,
-        "output_model_config": {k: v for k, v in model_cfg.items() if k != "api_key"},
+        "output_model_config": strip_sensitive_config(model_cfg),
     }
     save_json(meta_json, metadata)
     n_ch = len(chunks)
@@ -763,14 +596,11 @@ def stage_collect(
         if not isinstance(existing, list):
             existing = []
         merged_results = upsert_simpleqa_results(existing, to_write)
-        ordered_payload: dict[str, Any] = {
-            "model_config": metadata.get("output_model_config", {}),
-        }
-        if isinstance(payload.get("evaluator_config"), dict):
-            ordered_payload["evaluator_config"] = payload["evaluator_config"]
-        if isinstance(payload.get("summary"), dict):
-            ordered_payload["summary"] = payload["summary"]
-        ordered_payload["results"] = merged_results
+        ordered_payload = build_simpleqa_output_payload(
+            model_config=metadata.get("output_model_config", {}),
+            results=merged_results,
+            base_payload=payload if isinstance(payload, dict) else None,
+        )
         save_json(Path(results_path), ordered_payload)
 
     done = set(metadata.get("completed_chunk_indices", []))
