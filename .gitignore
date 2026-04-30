@@ -1,0 +1,6 @@
+result
+**/evaluators.yaml
+**/models.yaml
+batch_api/**/artifacts
+__pycache__/
+*.pyc
