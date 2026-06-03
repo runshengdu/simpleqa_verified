@@ -17,6 +17,7 @@ from common_config import (
     load_yaml_config,
     save_json,
     strip_sensitive_config,
+    usage_to_token_count,
 )
 from prompts import QUERY_TEMPLATE, GRADER_TEMPLATE
 
@@ -90,32 +91,49 @@ def calculate_summary(run_results: list) -> Dict[str, Any]:
         },
     }
 
-async def call_api_with_retry(client: AsyncOpenAI, messages: List[Dict], model: str, **kwargs) -> str:
-    """Calls OpenAI API with retries using streaming."""
+async def call_api_with_retry(
+    client: AsyncOpenAI, messages: List[Dict], model: str, **kwargs
+) -> Tuple[str, int]:
+    """Calls OpenAI API with retries using streaming. Returns (text, token_count)."""
     retries = 3
     for attempt in range(retries):
         try:
-            kwargs["stream"] = True
-            stream = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                **kwargs,
-            )
+            create_kwargs = {**kwargs, "stream": True}
+            if "stream_options" not in create_kwargs:
+                create_kwargs["stream_options"] = {"include_usage": True}
+            try:
+                stream = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    **create_kwargs,
+                )
+            except Exception:
+                create_kwargs.pop("stream_options", None)
+                stream = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    **create_kwargs,
+                )
 
-            collected_content = []
+            collected_content: list[str] = []
+            usage_obj = None
             async for chunk in stream:
-                content = chunk.choices[0].delta.content
-                if content:
-                    collected_content.append(content)
+                if chunk.choices:
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        collected_content.append(content)
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    usage_obj = chunk_usage
 
-            return "".join(collected_content)
+            return "".join(collected_content), usage_to_token_count(usage_obj)
 
         except Exception as e:
             if attempt == retries - 1:
                 print(f"API call failed after {retries} attempts: {e}")
                 raise e
             await asyncio.sleep(1 * (attempt + 1))
-    return ""
+    return "", 0
 
 async def generate_task(
     sem: asyncio.Semaphore,
@@ -133,7 +151,7 @@ async def generate_task(
 
             formatted_prompt = QUERY_TEMPLATE.format(question=query)
             try:
-                prediction = await call_api_with_retry(
+                prediction, tokens = await call_api_with_retry(
                     generator_client,
                     [{"role": "user", "content": formatted_prompt}],
                     model=generator_model,
@@ -156,6 +174,7 @@ async def generate_task(
                 "id": str(item_id),
                 "query": query,
                 "llm_answer": prediction,
+                "tokens": int(tokens),
                 "gold_answer": gold_answer,
                 "topic": item.get("topic"),
                 "answer_type": item.get("answer_type"),
@@ -192,7 +211,7 @@ async def evaluate_generated_task(
                 predicted_answer=prediction,
             )
             try:
-                grading_response_text = await call_api_with_retry(
+                grading_response_text, _ = await call_api_with_retry(
                     judge_client,
                     [{"role": "user", "content": grader_prompt}],
                     model=judge_model,

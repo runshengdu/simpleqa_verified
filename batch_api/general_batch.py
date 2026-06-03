@@ -1,4 +1,8 @@
-"""IFBench batch generation via OpenAI Batch API; output matches run_eval.py for evaluation."""
+"""SimpleQA batch generation via OpenAI-compatible Batch API (chat completions).
+
+Unified entrypoint for Moonshot (Kimi) and Alibaba DashScope (Qwen).
+Provider is auto-detected from the model id keyword ('kimi' or 'qwen').
+"""
 from __future__ import annotations
 
 import argparse
@@ -12,7 +16,7 @@ from typing import Any
 
 from openai import OpenAI
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 _src = REPO_ROOT / "src"
@@ -42,6 +46,44 @@ from prompts import QUERY_TEMPLATE  # noqa: E402
 
 TERMINAL_BATCH_STATES = {"completed", "failed", "expired", "cancelled"}
 
+# Per-provider settings. Provider is selected by a keyword in model_id.
+PROVIDER_MOONSHOT = "moonshot"
+PROVIDER_QWEN = "qwen"
+
+KIMI_BATCH_FORBIDDEN_PARAMS = {
+    "temperature",
+    "max_tokens",
+    "max_completion_tokens",
+    "top_p",
+    "n",
+    "presence_penalty",
+    "frequency_penalty",
+}
+
+PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
+    PROVIDER_MOONSHOT: {
+        "artifacts_dir": "batch_api/moonshot/artifacts",
+        "max_tasks_per_batch": 1000,
+    },
+    PROVIDER_QWEN: {
+        "artifacts_dir": "batch_api/qwen/artifacts",
+        "max_tasks_per_batch": 5000,
+    },
+}
+
+
+def detect_provider(model_id: str) -> str:
+    """Pick provider branch from a keyword in the model id."""
+    m = str(model_id).lower()
+    if "kimi" in m:
+        return PROVIDER_MOONSHOT
+    if "qwen" in m:
+        return PROVIDER_QWEN
+    raise SystemExit(
+        f"cannot detect provider from model id {model_id!r}: "
+        "expected the id to contain 'kimi' or 'qwen'"
+    )
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -55,7 +97,7 @@ def parse_args() -> argparse.Namespace:
         help="Pipeline step. Full flow: prepare / upload / create / wait / collect.",
     )
     parser.add_argument(
-        "--model-id", type=str, default="qwen3.6-plus", help="Model id in models.yaml (name field)"
+        "--model-id", type=str, default="kimi-k2.6", help="Model id in models.yaml (name field)"
     )
     parser.add_argument(
         "--input-csv",
@@ -82,19 +124,13 @@ def parse_args() -> argparse.Namespace:
         "--completion-window",
         type=str,
         default="24h",
-        help="Batch completion window (e.g. 24h).",
+        help="Batch completion window (e.g. 24h). Range 24h-336h.",
     )
     parser.add_argument(
         "--poll-interval-seconds",
         type=int,
         default=10,
         help="Interval between batch status polls.",
-    )
-    parser.add_argument(
-        "--artifacts-dir",
-        type=str,
-        default="batch_api/qwen/artifacts",
-        help="Directory for batch_input.jsonl, meta.json, etc.",
     )
     parser.add_argument(
         "--run-dir",
@@ -104,12 +140,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--batch-id", type=str, default=None, help="Override batch id for wait / collect if needed."
-    )
-    parser.add_argument(
-        "--max-tasks-per-batch",
-        type=int,
-        default=5000,
-        help="Max lines per batch file (Qwen supports up to 50,000 per file; split when over).",
     )
     parser.add_argument(
         "--chunk-index",
@@ -159,24 +189,158 @@ def build_batch_request_body(
     model_id_for_filter: str,
     create_kwargs: dict[str, Any],
 ) -> dict[str, Any]:
-    _ = model_id_for_filter
-    return dict(merge_create_kwargs_to_batch_body(create_kwargs))
+    body: dict[str, Any] = dict(merge_create_kwargs_to_batch_body(create_kwargs))
+    if model_id_for_filter in {"kimi-k2.5", "kimi-k2.6"}:
+        for k in KIMI_BATCH_FORBIDDEN_PARAMS:
+            body.pop(k, None)
+    return body
 
 
-def validate_completion_window(value: str) -> str:
-    """Validate completion_window according to DashScope Batch constraints."""
+def validate_completion_window(value: str, *, enforce_openai_range: bool = True) -> str:
+    """Validate completion_window: integer + 'h' or 'd'; optional OpenAI batch 24h–336h rule."""
     s = str(value).strip().lower()
     m = re.fullmatch(r"(\d+)([hd])", s)
     if not m:
         raise ValueError(
             "completion_window must be an integer followed by 'h' or 'd' (e.g. 24h, 14d)"
         )
-    amount = int(m.group(1))
-    unit = m.group(2)
-    hours = amount if unit == "h" else amount * 24
-    if not (24 <= hours <= 336):
-        raise ValueError("completion_window must be between 24h and 336h")
+    if enforce_openai_range:
+        amount = int(m.group(1))
+        unit = m.group(2)
+        hours = amount if unit == "h" else amount * 24
+        if not (24 <= hours <= 336):
+            raise ValueError("completion_window must be between 24h and 336h")
     return s
+
+
+def normalize_pipeline_step(step: str) -> str:
+    if step == "submit":
+        return "upload"
+    if step == "poll":
+        return "wait"
+    return step
+
+
+def iter_simpleqa_batch_items(
+    args: argparse.Namespace,
+    responses_output: str,
+) -> tuple[list[tuple[int, dict[str, Any], list[dict[str, Any]]]], int]:
+    """Load dataset rows pending generation. Returns (items, resume_skipped)."""
+    items: list[tuple[int, dict[str, Any], list[dict[str, Any]]]] = []
+    dataset = load_simpleqa_dataset(_input_csv_path(args), args.num_tasks)
+    existing_ids = read_existing_generated_ids_simpleqa(responses_output)
+    resume_skipped = sum(1 for row in dataset if row["id"] in existing_ids)
+    if existing_ids:
+        print(
+            f"resume: {len(existing_ids)} id(s) already in {responses_output} will be skipped"
+        )
+    for key, row in enumerate(dataset):
+        if row["id"] in existing_ids:
+            continue
+        prompt = str(QUERY_TEMPLATE.format(question=row["query"]))
+        messages = [{"role": "user", "content": prompt}]
+        items.append((int(key), row, messages))
+    return items, resume_skipped
+
+
+def build_job_batch_body(
+    model_cfg: dict[str, Any],
+    messages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Ark Job batch JSONL body (custom_id + body); model comes from ModelReference."""
+    create_kwargs = make_chat_completion_create_kwargs(model_cfg, messages)
+    body = merge_create_kwargs_to_batch_body(create_kwargs)
+    body.pop("model", None)
+    return body
+
+
+def build_batch_input_file_simpleqa_job(
+    items: list[tuple[int, dict[str, Any], list[dict[str, Any]]]],
+    model_cfg: dict[str, Any],
+    input_path: Path,
+) -> dict[str, dict[str, Any]]:
+    """Write Ark Job batch input JSONL: {custom_id, body} per line."""
+    key_payloads: dict[str, dict[str, Any]] = {}
+    with open(input_path, "w", encoding="utf-8", newline="\n") as f:
+        for key, payload, messages in items:
+            sk = str(int(key))
+            body = build_job_batch_body(model_cfg, messages)
+            request_obj: dict[str, Any] = {
+                "custom_id": custom_id_for_key(int(key)),
+                "body": body,
+            }
+            f.write(json.dumps(request_obj, ensure_ascii=False) + "\n")
+            key_payloads[sk] = {
+                "key": int(key),
+                "id": str(payload.get("id", "")),
+                "query": str(payload.get("query", "")),
+                "gold_answer": str(payload.get("gold_answer", "")),
+                "topic": payload.get("topic"),
+                "answer_type": payload.get("answer_type"),
+                "multi_step": payload.get("multi_step"),
+                "requires_reasoning": payload.get("requires_reasoning"),
+                "urls": payload.get("urls"),
+            }
+    return key_payloads
+
+
+def apply_collect_results(
+    metadata: dict[str, Any],
+    chunk_i: int,
+    key_payloads: dict[str, dict[str, Any]],
+    key_results: dict[str, dict[str, Any]],
+    submitted: set[str],
+) -> tuple[int, int, int]:
+    """Merge batch output into save_to JSON; update meta. Returns (written, not_returned, empty_skipped)."""
+    not_returned = submitted - set(key_results.keys())
+    success_keys_last_chunk: list[str] = []
+    to_write: list[dict[str, Any]] = []
+    empty_response_skipped: list[str] = []
+    for sk, res in key_results.items():
+        if sk not in submitted:
+            continue
+        text = res.get("response", "")
+        if not isinstance(text, str) or text.strip() == "":
+            empty_response_skipped.append(sk)
+            continue
+        success_keys_last_chunk.append(sk)
+        meta_row = key_payloads[sk]
+        to_write.append(
+            {
+                "id": str(meta_row.get("id", "")),
+                "query": str(meta_row.get("query", "")),
+                "llm_answer": text,
+                "tokens": int(res.get("tokens") or 0),
+                "gold_answer": str(meta_row.get("gold_answer", "")),
+                "topic": meta_row.get("topic"),
+                "answer_type": meta_row.get("answer_type"),
+                "multi_step": meta_row.get("multi_step"),
+                "requires_reasoning": meta_row.get("requires_reasoning"),
+                "urls": meta_row.get("urls"),
+            }
+        )
+
+    results_path = str(metadata["save_to"])
+    if to_write:
+        payload = load_simpleqa_output(results_path)
+        existing = payload.get("results", [])
+        if not isinstance(existing, list):
+            existing = []
+        merged_results = upsert_simpleqa_results(existing, to_write)
+        ordered_payload = build_simpleqa_output_payload(
+            model_config=metadata.get("output_model_config", {}),
+            results=merged_results,
+            base_payload=payload if isinstance(payload, dict) else None,
+        )
+        save_json(Path(results_path), ordered_payload)
+
+    done = set(metadata.get("completed_chunk_indices", []))
+    done.add(chunk_i)
+    metadata["completed_chunk_indices"] = sorted(done)
+    metadata["success_keys_last_chunk"] = sorted(int(x) for x in success_keys_last_chunk)
+    metadata["not_returned_in_output_keys"] = sorted(int(x) for x in not_returned)
+    metadata["empty_response_skipped_keys"] = sorted(int(x) for x in empty_response_skipped)
+    return len(to_write), len(not_returned), len(empty_response_skipped)
 
 
 def make_client(model_id: str, models_yaml: str) -> OpenAI:
@@ -289,6 +453,8 @@ def poll_batch(client: OpenAI, batch_id: str, poll_interval_seconds: int) -> Any
 
 def stage_prepare(args: argparse.Namespace) -> Path:
     model_id = str(args.model_id)
+    provider = detect_provider(model_id)
+    defaults = PROVIDER_DEFAULTS[provider]
     models_yaml = _models_yaml_path(args)
     responses_output = _resolve_responses_path(args)
 
@@ -297,39 +463,17 @@ def stage_prepare(args: argparse.Namespace) -> Path:
         raise ValueError(f"model not found in {models_yaml}: {model_id}")
     ensure_parent_dir(responses_output)
 
-    items: list[Any] = []
-    all_keys: set[int] = set()
-    pending_keys: set[int] = set()
-    csv_path = _input_csv_path(args)
-    dataset = load_simpleqa_dataset(csv_path, args.num_tasks)
-    existing_ids = read_existing_generated_ids_simpleqa(responses_output)
-    resume_skipped = sum(1 for row in dataset if row["id"] in existing_ids)
-    if existing_ids:
-        print(
-            f"resume: {len(existing_ids)} id(s) already in {responses_output} will be skipped"
-        )
-    for key, row in enumerate(dataset):
-        all_keys.add(int(key))
-        if row["id"] in existing_ids:
-            continue
-        pending_keys.add(int(key))
-        prompt = str(QUERY_TEMPLATE.format(question=row["query"]))
-        messages = [{"role": "user", "content": prompt}]
-        items.append((int(key), row, messages))
+    items, resume_skipped = iter_simpleqa_batch_items(args, responses_output)
 
-    if not pending_keys:
+    if not items:
         print("all tasks are already in output; nothing to do.")
         raise SystemExit(0)
 
-    if not items:
-        print("no pending items after resume filter.")
-        raise SystemExit(0)
-
-    max_per = int(args.max_tasks_per_batch)
+    max_per = int(defaults["max_tasks_per_batch"])
     if max_per < 1:
-        raise ValueError("--max-tasks-per-batch must be at least 1")
+        raise ValueError("max_tasks_per_batch must be at least 1")
 
-    artifacts_root = Path(args.artifacts_dir)
+    artifacts_root = Path(str(defaults["artifacts_dir"]))
     if not artifacts_root.is_absolute():
         artifacts_root = REPO_ROOT / artifacts_root
     run_dir = build_run_dir(artifacts_root, model_id)
@@ -374,6 +518,7 @@ def stage_prepare(args: argparse.Namespace) -> Path:
     metadata: dict[str, Any] = {
         "version": 3,
         "task_type": "simpleqa_verified",
+        "provider": provider,
         "model": model_id,
         "input_csv": input_csv_resolved,
         "save_to": responses_output,
@@ -563,53 +708,9 @@ def stage_collect(
     ch_sub = ch.get("submitted_keys", [])
     submitted = {str(x) for x in ch_sub} or set(key_payloads.keys())
 
-    not_returned = submitted - set(key_results.keys())
-    success_keys_last_chunk: list[str] = []
-    to_write: list[dict[str, Any]] = []
-    empty_response_skipped: list[str] = []
-    for sk, res in key_results.items():
-        if sk not in submitted:
-            continue
-        text = res.get("response", "")
-        if not isinstance(text, str) or text.strip() == "":
-            empty_response_skipped.append(sk)
-            continue
-        success_keys_last_chunk.append(sk)
-        meta_row = key_payloads[sk]
-        to_write.append(
-            {
-                "id": str(meta_row.get("id", "")),
-                "query": str(meta_row.get("query", "")),
-                "llm_answer": text,
-                "gold_answer": str(meta_row.get("gold_answer", "")),
-                "topic": meta_row.get("topic"),
-                "answer_type": meta_row.get("answer_type"),
-                "multi_step": meta_row.get("multi_step"),
-                "requires_reasoning": meta_row.get("requires_reasoning"),
-                "urls": meta_row.get("urls"),
-            }
-        )
-
-    if to_write:
-        payload = load_simpleqa_output(results_path)
-        existing = payload.get("results", [])
-        if not isinstance(existing, list):
-            existing = []
-        merged_results = upsert_simpleqa_results(existing, to_write)
-        ordered_payload = build_simpleqa_output_payload(
-            model_config=metadata.get("output_model_config", {}),
-            results=merged_results,
-            base_payload=payload if isinstance(payload, dict) else None,
-        )
-        save_json(Path(results_path), ordered_payload)
-
-    done = set(metadata.get("completed_chunk_indices", []))
-    done.add(chunk_i)
-    metadata["completed_chunk_indices"] = sorted(done)
-    metadata["success_keys_last_chunk"] = sorted(int(x) for x in success_keys_last_chunk)
-    metadata["not_returned_in_output_keys"] = sorted(int(x) for x in not_returned)
-    metadata["empty_response_skipped_keys"] = sorted(int(x) for x in empty_response_skipped)
-    written = len(to_write)
+    written, not_returned, empty_response_skipped = apply_collect_results(
+        metadata, chunk_i, key_payloads, key_results, submitted
+    )
     ntot = _chunk_count(metadata)
     save_json(meta_path, metadata)
     print(f"updated generation JSON: {results_path} (chunk {chunk_i} / {ntot})")
@@ -629,12 +730,9 @@ def _run_dir_from_arg(run_dir: str) -> Path:
 
 def main() -> None:
     args = parse_args()
+    detect_provider(str(args.model_id))
     args.completion_window = validate_completion_window(str(args.completion_window))
-    step = str(args.step)
-    if step == "submit":
-        step = "upload"
-    elif step == "poll":
-        step = "wait"
+    step = normalize_pipeline_step(str(args.step))
 
     if step in {"upload", "create", "wait", "collect"} and not args.run_dir:
         raise SystemExit(f"--step {step} requires --run-dir")

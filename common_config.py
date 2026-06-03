@@ -11,6 +11,9 @@ from typing import Any, Dict, Optional, Tuple
 import yaml
 
 CLIENT_CONFIG_EXCLUDE_KEYS = ("name", "api_key", "base_url")
+BATCH_ONLY_CONFIG_KEYS = ("batch_endpoint_id", "batch_foundation_model")
+# Providers use either max_tokens or max_completion_tokens; pass through as configured.
+COMPLETION_LIMIT_PARAM_KEYS = ("max_tokens", "max_completion_tokens")
 
 
 def _expand_env(value: Any) -> Any:
@@ -36,12 +39,27 @@ def load_yaml_config(path: str, model_name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def completion_limit_kwargs(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return max_tokens and/or max_completion_tokens using the key names from YAML."""
+    return {
+        key: config[key]
+        for key in COMPLETION_LIMIT_PARAM_KEYS
+        if key in config and config[key] is not None
+    }
+
+
 def get_client_params(config: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     params = {
         "api_key": config.get("api_key"),
         "base_url": config.get("base_url"),
     }
-    chat_kwargs = {k: v for k, v in config.items() if k not in CLIENT_CONFIG_EXCLUDE_KEYS}
+    excluded = set(CLIENT_CONFIG_EXCLUDE_KEYS) | set(BATCH_ONLY_CONFIG_KEYS)
+    chat_kwargs = {
+        k: v
+        for k, v in config.items()
+        if k not in excluded and k not in COMPLETION_LIMIT_PARAM_KEYS
+    }
+    chat_kwargs.update(completion_limit_kwargs(config))
     return params, chat_kwargs
 
 
@@ -220,6 +238,34 @@ def coerce_token_int(value: Any, default: int = 0) -> int:
     return default
 
 
+def usage_to_token_count(usage: Any) -> int:
+    """Sum input + output tokens from a chat/responses usage object."""
+    if usage is None:
+        return 0
+    if isinstance(usage, dict):
+        prompt = coerce_token_int(
+            usage.get("prompt_tokens") or usage.get("input_tokens"), 0
+        )
+        completion = coerce_token_int(
+            usage.get("completion_tokens") or usage.get("output_tokens"), 0
+        )
+        total = coerce_token_int(usage.get("total_tokens"), 0)
+    else:
+        prompt = coerce_token_int(
+            getattr(usage, "prompt_tokens", None) or getattr(usage, "input_tokens", None),
+            0,
+        )
+        completion = coerce_token_int(
+            getattr(usage, "completion_tokens", None)
+            or getattr(usage, "output_tokens", None),
+            0,
+        )
+        total = coerce_token_int(getattr(usage, "total_tokens", None), 0)
+    if total > 0:
+        return total
+    return prompt + completion
+
+
 def custom_id_for_key(key: int) -> str:
     return f"key-{key}"
 
@@ -272,7 +318,9 @@ def _parse_batch_success_payload(data: dict[str, Any]) -> Optional[dict[str, Any
     response = data.get("response") or {}
     status_code = response.get("status_code")
     body = response.get("body") or {}
-    if err is not None or status_code not in {0, 200}:
+    if err is not None:
+        return None
+    if status_code is not None and status_code not in {0, 200}:
         return None
 
     choices = body.get("choices") or []
@@ -284,11 +332,7 @@ def _parse_batch_success_payload(data: dict[str, Any]) -> Optional[dict[str, Any
     if not isinstance(content, str):
         return None
 
-    usage = body.get("usage") or {}
-    prompt_tokens = coerce_token_int(usage.get("prompt_tokens"), 0)
-    completion_tokens = coerce_token_int(usage.get("completion_tokens"), 0)
-    total_tokens = coerce_token_int(usage.get("total_tokens"), 0) or (prompt_tokens + completion_tokens)
     return {
         "response": content,
-        "total_tokens": int(total_tokens),
+        "tokens": usage_to_token_count(body.get("usage")),
     }

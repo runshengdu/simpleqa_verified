@@ -57,6 +57,16 @@ models:
     api_key: "${ARK_API_KEY}"
     extra_body: {"reasoning_effort": "high"}
     max_tokens: 60000
+    # For batch_api/doubao_batch.py (Job + TOS): either ep- endpoint or foundation model:
+    # batch_endpoint_id: ep-your-endpoint-id
+    # batch_foundation_model: {name: doubao-xxx, model_version: "240615"}
+
+  - name: ep-your-endpoint-id
+    temperature: 1.0
+    base_url: https://ark.cn-beijing.volces.com/api/v3
+    api_key: "${ARK_API_KEY}"
+    extra_body: {"reasoning_effort": "high"}
+    max_tokens: 60000
 
   - name: qwen3.5-plus
     temperature: 1.0
