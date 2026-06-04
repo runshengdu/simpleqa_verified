@@ -423,7 +423,7 @@ async def run_evaluation_mode(args: argparse.Namespace) -> None:
 async def main_async():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-id", help="Model to generate answers", default="kimi-k2.5")
-    parser.add_argument("--evaluator", help="Evaluator model to use", default="deepseek-v4-flash")
+    parser.add_argument("--evaluator", help="Evaluator model to use", default="deepseek-v4-pro")
     parser.add_argument("--save-to", help="Path to save the results")
     parser.add_argument("--evaluate-file", help="Evaluate an existing generation JSON file")
     parser.add_argument("--num-tasks", type=int, help="Number of tasks to run from the start of the dataset")
