@@ -6,192 +6,334 @@ https://www.volcengine.com/docs/82379/1339603
 from __future__ import annotations
 
 import argparse
+import os
+import sys
 from pathlib import Path
 from typing import Any
 
-from common_config import (
-    load_json,
-    load_yaml_config,
-    parse_batch_output,
-    sanitize_path_component,
-    save_json,
-    save_text,
-    strip_sensitive_config,
-)
-from batch_api.doubao_volc import (
-    DEFAULT_PROJECT_NAME,
-    DEFAULT_TOS_BUCKET,
-    build_model_reference,
-    create_batch_inference_job,
-    download_results_jsonl,
-    get_batch_job,
-    make_ark_api,
-    make_tos_client,
-    poll_batch_job,
-    upload_file_to_tos,
-)
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import tos
+import volcenginesdkark.models as ark_models
+import volcenginesdkcore
+from volcenginesdkark.api.ark_api import ARKApi
+
+from common_config import save_json
 from batch_api.general_batch import (
-    REPO_ROOT,
-    _chunk_count,
-    _input_csv_path,
+    PROVIDER_DEFAULTS,
+    PROVIDER_DOUBAO,
     _models_yaml_path,
     _mut_chunk,
     _resolve_chunk_index,
-    _resolve_responses_path,
-    _run_dir_from_arg,
-    apply_collect_results,
+    add_simpleqa_batch_arguments,
     build_batch_input_file_simpleqa_job,
-    build_run_dir,
-    iter_simpleqa_batch_items,
+    detect_provider,
+    finish_simpleqa_collect,
     load_meta_or_fail,
-    normalize_pipeline_step,
+    load_yaml_config,
+    poll_until_terminal,
+    prepare_simpleqa_run,
+    run_simpleqa_pipeline,
+    save_chunk_meta,
     validate_completion_window,
 )
 
-PROVIDER_DOUBAO = "doubao"
+ARK_REGION = "cn-beijing"
+DEFAULT_TOS_ENDPOINT = "tos-cn-beijing.volces.com"
+DEFAULT_TOS_REGION = "cn-beijing"
+TOS_BUCKET = "batch-doubao"
+ARK_PROJECT_NAME = "default"
 
-DOUBAO_DEFAULTS: dict[str, Any] = {
-    "artifacts_dir": "batch_api/doubao/artifacts",
-    "max_tasks_per_batch": 5000,
-    "tos_input_prefix": "batch-inference-job/dataset",
-    "tos_output_prefix": "batch-inference-job/output",
+TERMINAL_JOB_PHASES = {
+    "Finished",
+    "Failed",
+    "Cancelled",
+    "Expired",
+    "Terminated",
+    "Completed",
+    "Success",
 }
 
-TOS_BUCKET = DEFAULT_TOS_BUCKET
-ARK_PROJECT_NAME = DEFAULT_PROJECT_NAME
+SUCCESS_JOB_PHASES = {"Finished", "Completed", "Success"}
 
 
-def validate_doubao_model(model_id: str) -> None:
-    m = str(model_id).lower()
-    if "doubao" in m or m.startswith("ep-"):
-        return
-    raise SystemExit(
-        f"model id {model_id!r} is not a Doubao/Ark model: "
-        "expected 'doubao' in the name or an 'ep-' endpoint id"
+def volc_credentials() -> tuple[str, str]:
+    ak = os.environ.get("VOLC_ACCESSKEY", "").strip()
+    sk = os.environ.get("VOLC_SECRETKEY", "").strip()
+    if not ak or not sk:
+        raise SystemExit(
+            "VOLC_ACCESSKEY and VOLC_SECRETKEY must be set (see Volcengine IAM docs)."
+        )
+    return ak, sk
+
+
+def make_tos_client(
+    endpoint: str | None = None,
+    region: str | None = None,
+) -> tos.TosClientV2:
+    ak, sk = volc_credentials()
+    return tos.TosClientV2(
+        ak,
+        sk,
+        endpoint or os.environ.get("TOS_ENDPOINT", DEFAULT_TOS_ENDPOINT),
+        region or os.environ.get("TOS_REGION", DEFAULT_TOS_REGION),
     )
+
+
+def make_ark_api() -> ARKApi:
+    ak, sk = volc_credentials()
+    configuration = volcenginesdkcore.Configuration()
+    configuration.ak = ak
+    configuration.sk = sk
+    configuration.region = ARK_REGION
+    return ARKApi(volcenginesdkcore.ApiClient(configuration))
+
+
+def upload_file_to_tos(
+    client: tos.TosClientV2,
+    bucket: str,
+    object_key: str,
+    local_path: Path,
+) -> str:
+    client.put_object_from_file(bucket, object_key, str(local_path))
+    print(f"TOS upload done: tos://{bucket}/{object_key}")
+    return object_key
+
+
+def ensure_tos_output_prefix(
+    client: tos.TosClientV2,
+    bucket: str,
+    output_prefix: str,
+) -> str:
+    """Create a placeholder object so Ark can resolve OutputDirTosLocation."""
+    prefix = str(output_prefix).lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    placeholder_key = f"{prefix}.keep"
+    client.put_object(bucket, placeholder_key, content=b"")
+    print(f"TOS output prefix ready: tos://{bucket}/{prefix}")
+    return prefix
+
+
+def download_results_jsonl(
+    client: tos.TosClientV2,
+    bucket: str,
+    output_prefix: str,
+    dest_path: Path,
+) -> str:
+    prefix = str(output_prefix).lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+
+    chosen_key: str | None = None
+    truncated = True
+    continuation = ""
+    while truncated:
+        resp = client.list_objects_type2(
+            bucket,
+            prefix=prefix,
+            continuation_token=continuation or None,
+        )
+        for obj in resp.contents or []:
+            key = getattr(obj, "key", "") or ""
+            if key.endswith("results.jsonl"):
+                chosen_key = key
+                break
+        truncated = bool(getattr(resp, "is_truncated", False))
+        continuation = getattr(resp, "next_continuation_token", "") or ""
+        if chosen_key:
+            break
+
+    if not chosen_key:
+        raise FileNotFoundError(
+            f"results.jsonl not found under tos://{bucket}/{prefix} "
+            "(job may still be running or output path differs)"
+        )
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    client.get_object_to_file(bucket, chosen_key, str(dest_path))
+    print(f"TOS download done: tos://{bucket}/{chosen_key} -> {dest_path}")
+    return chosen_key
+
+
+def build_model_reference(
+    model_id: str,
+    model_cfg: dict[str, Any],
+) -> ark_models.ModelReferenceForCreateBatchInferenceJobInput:
+    """Map models.yaml entry to CreateBatchInferenceJob ModelReference."""
+    batch_fm = model_cfg.get("batch_foundation_model")
+    if isinstance(batch_fm, dict) and batch_fm.get("name"):
+        fm = ark_models.FoundationModelForCreateBatchInferenceJobInput(
+            name=str(batch_fm["name"]),
+            model_version=str(
+                batch_fm.get("model_version") or batch_fm.get("version") or ""
+            ),
+        )
+        return ark_models.ModelReferenceForCreateBatchInferenceJobInput(
+            foundation_model=fm
+        )
+
+    endpoint_id = str(model_cfg.get("batch_endpoint_id") or model_id)
+    if endpoint_id.startswith("ep-"):
+        return ark_models.ModelReferenceForCreateBatchInferenceJobInput(
+            custom_model_id=endpoint_id
+        )
+
+    raise ValueError(
+        f"batch job model reference: set batch_endpoint_id / use ep- id, or add "
+        f"batch_foundation_model {{name, model_version}} in models.yaml for {model_id!r}"
+    )
+
+
+def create_batch_inference_job(
+    ark: ARKApi,
+    *,
+    name: str,
+    model_reference: ark_models.ModelReferenceForCreateBatchInferenceJobInput,
+    input_bucket: str,
+    input_object_key: str,
+    output_bucket: str,
+    output_prefix: str,
+    completion_window: str,
+    project_name: str,
+    description: str = "",
+) -> str:
+    req = ark_models.CreateBatchInferenceJobRequest(
+        name=name,
+        description=description or name,
+        model_reference=model_reference,
+        input_file_tos_location=ark_models.InputFileTosLocationForCreateBatchInferenceJobInput(
+            bucket_name=input_bucket,
+            object_key=input_object_key,
+        ),
+        output_dir_tos_location=ark_models.OutputDirTosLocationForCreateBatchInferenceJobInput(
+            bucket_name=output_bucket,
+            object_key=output_prefix,
+        ),
+        project_name=project_name,
+        completion_window=completion_window,
+    )
+    resp = ark.create_batch_inference_job(req)
+    job_id = resp.id
+    if not job_id:
+        raise RuntimeError("CreateBatchInferenceJob returned empty id")
+    print(f"batch inference job created: {job_id}")
+    return str(job_id)
+
+
+def get_batch_job(
+    ark: ARKApi, job_id: str, project_name: str
+) -> ark_models.ItemForListBatchInferenceJobsOutput:
+    req = ark_models.ListBatchInferenceJobsRequest(
+        project_name=project_name,
+        page_number=1,
+        page_size=10,
+        filter=ark_models.FilterForListBatchInferenceJobsInput(ids=[job_id]),
+    )
+    resp = ark.list_batch_inference_jobs(req)
+    items = resp.items or []
+    for item in items:
+        if getattr(item, "id", None) == job_id:
+            return item
+    if items:
+        return items[0]
+    raise RuntimeError(f"batch job not found: {job_id}")
+
+
+def poll_batch_job(
+    ark: ARKApi,
+    job_id: str,
+    project_name: str,
+    poll_interval_seconds: int,
+) -> ark_models.ItemForListBatchInferenceJobsOutput:
+    def _counts(job: Any) -> tuple[int | None, int | None]:
+        counts = job.request_counts
+        if not counts:
+            return None, None
+        return getattr(counts, "completed", None), getattr(counts, "total", None)
+
+    def _phase(job: Any) -> str:
+        if job.status and getattr(job.status, "phase", None):
+            return str(job.status.phase)
+        return ""
+
+    return poll_until_terminal(
+        lambda: get_batch_job(ark, job_id, project_name),
+        get_status=_phase,
+        get_counts=_counts,
+        terminal_states=TERMINAL_JOB_PHASES,
+        poll_interval_seconds=poll_interval_seconds,
+        status_label="job status",
+        hide_zero_total=True,
+    )
+
+
+def _tos_dataset_prefix(run_dir: Path, safe_model: str) -> str:
+    prefix = PROVIDER_DEFAULTS[PROVIDER_DOUBAO]["tos_input_prefix"]
+    return f"{prefix}/{safe_model}/{run_dir.name}"
+
+
+def _tos_output_prefix(run_dir: Path, safe_model: str, chunk_idx: int) -> str:
+    prefix = PROVIDER_DEFAULTS[PROVIDER_DOUBAO]["tos_output_prefix"]
+    return f"{prefix}/{safe_model}/{run_dir.name}/c{chunk_idx:03d}/"
+
+
+def _print_doubao_prepare_done(
+    run_dir: Path, metadata: dict[str, Any], n_ch: int, max_per: int
+) -> None:
+    all_submitted = metadata.get("submitted_keys", [])
+    resume_skipped = metadata.get("resume_skipped", 0)
+    print(
+        f"prepare done, run_dir={run_dir} ({n_ch} file(s), {max_per} lines max, "
+        f"{len(all_submitted)} key(s), resume skipped: {resume_skipped})"
+    )
+    print(f"TOS bucket: {metadata.get('tos_bucket', TOS_BUCKET)}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="SimpleQA: Doubao batch inference (Ark Job API + TOS)."
     )
-    parser.add_argument(
-        "--step",
-        type=str,
-        default="all",
-        choices=["all", "prepare", "upload", "create", "wait", "collect", "submit", "poll"],
+    add_simpleqa_batch_arguments(
+        parser,
+        default_model_id="doubao-seed-2-0-pro-260215",
+        default_completion_window="1d",
+        default_poll_interval_seconds=30,
     )
-    parser.add_argument("--model-id", type=str, default="doubao-seed-2-0-pro-260215")
-    parser.add_argument("--input-csv", type=str, default="dataset/simpleqa_verified.csv")
-    parser.add_argument("--save-to", type=str, default=None)
-    parser.add_argument("--num-tasks", type=int, default=None)
-    parser.add_argument("--models-yaml", type=str, default="models.yaml")
-    parser.add_argument("--completion-window", type=str, default="1d")
-    parser.add_argument("--poll-interval-seconds", type=int, default=30)
-    parser.add_argument("--run-dir", type=str, default=None)
-    parser.add_argument("--batch-id", type=str, default=None)
-    parser.add_argument("--chunk-index", type=int, default=None)
     return parser.parse_args()
 
 
-def _tos_dataset_prefix(run_dir: Path, safe_model: str) -> str:
-    return f"{DOUBAO_DEFAULTS['tos_input_prefix']}/{safe_model}/{run_dir.name}"
-
-
-def _tos_output_prefix(run_dir: Path, safe_model: str, chunk_idx: int) -> str:
-    return f"{DOUBAO_DEFAULTS['tos_output_prefix']}/{safe_model}/{run_dir.name}/c{chunk_idx:03d}/"
-
-
 def stage_prepare(args: argparse.Namespace) -> Path:
-    model_id = str(args.model_id)
-    validate_doubao_model(model_id)
-    defaults = DOUBAO_DEFAULTS
-    models_yaml = _models_yaml_path(args)
-    responses_output = _resolve_responses_path(args)
+    provider = detect_provider(str(args.model_id))
+    defaults = PROVIDER_DEFAULTS[provider]
 
-    model_cfg = load_yaml_config(models_yaml, model_id)
-    if not model_cfg:
-        raise ValueError(f"model not found in {models_yaml}: {model_id}")
+    def chunk_extra(chunk_idx: int, run_dir: Path, safe_model: str) -> dict[str, Any]:
+        return {
+            "tos_bucket": TOS_BUCKET,
+            "tos_input_object_key": (
+                f"{_tos_dataset_prefix(run_dir, safe_model)}/batch_input_c{chunk_idx:03d}.jsonl"
+            ),
+            "tos_output_prefix": _tos_output_prefix(run_dir, safe_model, chunk_idx),
+            "job_id": None,
+            "job_phase": None,
+        }
 
-    items, resume_skipped = iter_simpleqa_batch_items(args, responses_output)
-    if not items:
-        print("all tasks are already in output; nothing to do.")
-        raise SystemExit(0)
-
-    max_per = int(defaults["max_tasks_per_batch"])
-    artifacts_root = Path(str(defaults["artifacts_dir"]))
-    if not artifacts_root.is_absolute():
-        artifacts_root = REPO_ROOT / artifacts_root
-    run_dir = build_run_dir(artifacts_root, model_id)
-    safe_model = sanitize_path_component(model_id)
-    tos_bucket = TOS_BUCKET
-
-    chunks: list[dict[str, Any]] = []
-    all_submitted: list[int] = []
-    for off in range(0, len(items), max_per):
-        chunk_idx = len(chunks)
-        chunk_items = items[off : off + max_per]
-        input_jsonl = run_dir / f"batch_input_c{chunk_idx:03d}.jsonl"
-        output_jsonl = run_dir / f"batch_output_c{chunk_idx:03d}.jsonl"
-        error_jsonl = run_dir / f"batch_error_c{chunk_idx:03d}.jsonl"
-        key_payloads_path = run_dir / f"key_payloads_c{chunk_idx:03d}.json"
-        key_payloads = build_batch_input_file_simpleqa_job(
-            items=chunk_items,
-            model_cfg=model_cfg,
-            input_path=input_jsonl,
-        )
-        submitted = sorted(int(k) for k in key_payloads.keys())
-        all_submitted.extend(submitted)
-        save_json(key_payloads_path, {str(k): key_payloads[str(k)] for k in submitted})
-        chunks.append(
-            {
-                "index": chunk_idx,
-                "input_jsonl": str(input_jsonl),
-                "output_jsonl": str(output_jsonl),
-                "error_jsonl": str(error_jsonl),
-                "key_payloads_json": str(key_payloads_path),
-                "submitted_keys": submitted,
-                "tos_bucket": tos_bucket,
-                "tos_input_object_key": (
-                    f"{_tos_dataset_prefix(run_dir, safe_model)}/batch_input_c{chunk_idx:03d}.jsonl"
-                ),
-                "tos_output_prefix": _tos_output_prefix(run_dir, safe_model, chunk_idx),
-                "job_id": None,
-                "job_phase": None,
-            }
-        )
-
-    metadata: dict[str, Any] = {
-        "version": 4,
-        "task_type": "simpleqa_verified",
-        "provider": PROVIDER_DOUBAO,
-        "batch_mode": "job",
-        "model": model_id,
-        "input_csv": str(Path(_input_csv_path(args)).resolve()),
-        "save_to": responses_output,
-        "models_yaml": str(Path(models_yaml).resolve()) if Path(models_yaml).is_file() else models_yaml,
-        "num_tasks": args.num_tasks,
-        "max_tasks_per_batch": max_per,
-        "tos_bucket": tos_bucket,
-        "project_name": ARK_PROJECT_NAME,
-        "run_dir": str(run_dir),
-        "chunks": chunks,
-        "chunk_count": len(chunks),
-        "completed_chunk_indices": [],
-        "completion_window": str(args.completion_window),
-        "poll_interval_seconds": int(args.poll_interval_seconds),
-        "submitted_keys": sorted(set(all_submitted)),
-        "resume_skipped": resume_skipped,
-        "output_model_config": strip_sensitive_config(model_cfg),
-    }
-    save_json(run_dir / "meta.json", metadata)
-    n_ch = len(chunks)
-    print(
-        f"prepare done, run_dir={run_dir} ({n_ch} file(s), {max_per} lines max, "
-        f"{len(set(all_submitted))} key(s), resume skipped: {resume_skipped})"
+    return prepare_simpleqa_run(
+        args,
+        provider=provider,
+        defaults=defaults,
+        build_chunk_input=build_batch_input_file_simpleqa_job,
+        chunk_extra=chunk_extra,
+        metadata_version=4,
+        metadata_extra={
+            "batch_mode": "job",
+            "tos_bucket": TOS_BUCKET,
+            "project_name": ARK_PROJECT_NAME,
+        },
+        after_prepare_print=_print_doubao_prepare_done,
     )
-    print(f"TOS bucket: {tos_bucket}")
-    return run_dir
 
 
 def stage_upload(args: argparse.Namespace, run_dir: Path) -> None:
@@ -205,10 +347,12 @@ def stage_upload(args: argparse.Namespace, run_dir: Path) -> None:
     bucket = TOS_BUCKET
     object_key = str(ch["tos_input_object_key"])
     upload_file_to_tos(make_tos_client(), bucket, object_key, input_jsonl)
-    ch["tos_uploaded"] = True
-    ch["job_id"] = None
-    ch["job_phase"] = None
-    save_json(meta_path, metadata)
+    save_chunk_meta(
+        meta_path,
+        metadata,
+        chunk_i,
+        {"tos_uploaded": True, "job_id": None, "job_phase": None},
+    )
     print(f"upload done, chunk={chunk_i}, tos://{bucket}/{object_key}")
 
 
@@ -231,6 +375,9 @@ def stage_create(args: argparse.Namespace, run_dir: Path) -> str:
         enforce_openai_range=False,
     )
     bucket = TOS_BUCKET
+    tos_client = make_tos_client()
+    output_prefix = str(ch["tos_output_prefix"])
+    ensure_tos_output_prefix(tos_client, bucket, output_prefix)
 
     job_id = create_batch_inference_job(
         make_ark_api(),
@@ -239,15 +386,18 @@ def stage_create(args: argparse.Namespace, run_dir: Path) -> str:
         input_bucket=bucket,
         input_object_key=str(ch["tos_input_object_key"]),
         output_bucket=bucket,
-        output_prefix=str(ch["tos_output_prefix"]),
+        output_prefix=output_prefix,
         completion_window=completion_window,
         project_name=ARK_PROJECT_NAME,
         description=f"simpleqa chunk {chunk_i}",
     )
-    ch["job_id"] = job_id
-    ch["job_phase"] = "Queued"
     metadata["completion_window"] = completion_window
-    save_json(meta_path, metadata)
+    save_chunk_meta(
+        meta_path,
+        metadata,
+        chunk_i,
+        {"job_id": job_id, "job_phase": "Queued"},
+    )
     print(f"create done, chunk={chunk_i}, job_id={job_id}")
     return job_id
 
@@ -263,9 +413,12 @@ def stage_wait(args: argparse.Namespace, run_dir: Path) -> Any:
     interval = int(args.poll_interval_seconds or metadata.get("poll_interval_seconds") or 30)
     job = poll_batch_job(make_ark_api(), str(job_id), ARK_PROJECT_NAME, interval)
     phase = job.status.phase if job.status else ""
-    ch["job_id"] = str(job_id)
-    ch["job_phase"] = str(phase)
-    save_json(meta_path, metadata)
+    save_chunk_meta(
+        meta_path,
+        metadata,
+        chunk_i,
+        {"job_id": str(job_id), "job_phase": str(phase)},
+    )
     print(f"wait done, chunk={chunk_i}, final phase: {phase}")
     return job
 
@@ -285,82 +438,40 @@ def stage_collect(args: argparse.Namespace, run_dir: Path, job_obj: Any | None =
     ch["job_id"] = str(job_id)
     ch["job_phase"] = phase
 
-    if phase != "Finished":
+    if phase not in SUCCESS_JOB_PHASES:
         save_json(meta_path, metadata)
+        if phase in TERMINAL_JOB_PHASES:
+            raise RuntimeError(f"batch job ended without success, phase={phase}")
         raise RuntimeError(f"batch job not finished, phase={phase}")
 
     bucket = TOS_BUCKET
     output_jsonl = Path(ch["output_jsonl"])
     key_payloads_path = Path(ch["key_payloads_json"])
-    key_payloads = load_json(key_payloads_path)
-    for k in list(key_payloads.keys()):
-        key_payloads[k]["key"] = int(key_payloads[k]["key"])
 
     download_results_jsonl(
         make_tos_client(), bucket, str(ch["tos_output_prefix"]), output_jsonl
     )
     output_text = output_jsonl.read_text(encoding="utf-8")
-    save_text(output_jsonl, output_text)
 
-    key_results, _ = parse_batch_output(output_text, key_payloads)
-    ch_sub = ch.get("submitted_keys", [])
-    submitted = {str(x) for x in ch_sub} or set(key_payloads.keys())
-    written, not_returned, empty_skipped = apply_collect_results(
-        metadata, chunk_i, key_payloads, key_results, submitted
+    finish_simpleqa_collect(
+        meta_path, metadata, chunk_i, output_text, key_payloads_path, run_dir
     )
-
-    results_path = str(metadata["save_to"])
-    ntot = _chunk_count(metadata)
-    save_json(meta_path, metadata)
-    print(f"updated generation JSON: {results_path} (chunk {chunk_i} / {ntot})")
-    print(f"evaluate next: python main.py --evaluate-file \"{results_path}\" --evaluator deepseek-v4-flash")
-    print(
-        f"this collect: {written} line(s); not returned: {not_returned}; empty skipped: {empty_skipped}"
-    )
-    print(f"run_dir={run_dir}")
 
 
 def main() -> None:
     args = parse_args()
-    validate_doubao_model(str(args.model_id))
+    detect_provider(str(args.model_id))
     args.completion_window = validate_completion_window(
         str(args.completion_window), enforce_openai_range=False
     )
-    step = normalize_pipeline_step(str(args.step))
-
-    if step in {"upload", "create", "wait", "collect"} and not args.run_dir:
-        raise SystemExit(f"--step {step} requires --run-dir")
-
-    if step == "prepare":
-        stage_prepare(args)
-        return
-    if step == "upload":
-        stage_upload(args, _run_dir_from_arg(args.run_dir))
-        return
-    if step == "create":
-        stage_create(args, _run_dir_from_arg(args.run_dir))
-        return
-    if step == "wait":
-        stage_wait(args, _run_dir_from_arg(args.run_dir))
-        return
-    if step == "collect":
-        stage_collect(args, _run_dir_from_arg(args.run_dir), job_obj=None)
-        return
-
-    run_path = stage_prepare(args)
-    _, run_meta = load_meta_or_fail(run_path)
-    done = set(run_meta.get("completed_chunk_indices", []))
-    for i in range(_chunk_count(run_meta)):
-        if i in done:
-            print(f"skipping chunk {i} (already completed)")
-            continue
-        args.chunk_index = i
-        print(f"--- batch chunk {i + 1}/{_chunk_count(run_meta)} ---")
-        stage_upload(args, run_path)
-        stage_create(args, run_path)
-        job = stage_wait(args, run_path)
-        stage_collect(args, run_path, job_obj=job)
-    args.chunk_index = None
+    run_simpleqa_pipeline(
+        args,
+        stage_prepare=stage_prepare,
+        stage_upload=stage_upload,
+        stage_create=stage_create,
+        stage_wait=stage_wait,
+        stage_collect=stage_collect,
+    )
 
 
 if __name__ == "__main__":
